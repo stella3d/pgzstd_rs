@@ -4,11 +4,6 @@ use zstd::{decode_all, encode_all};
 pgrx::pg_module_magic!();
 
 #[pg_extern]
-fn hello_pgzstd_rs() -> &'static str {
-    "Hello, pgzstd_rs"
-}
-
-#[pg_extern]
 pub(crate) fn to_zstd(data: &[u8], level: i32) -> Result<Vec<u8>, &'static str> {
     encode_all(data, level).map_err(|_| "Compression error")
 }
