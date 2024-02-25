@@ -13,6 +13,13 @@ pub(crate) fn from_zstd(data: &[u8]) -> Result<Vec<u8>, &'static str> {
     decode_all(data).map_err(|_| "Decompression error")
 }
 
+#[pg_extern]
+fn from_maybe_zstd(data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    match crate::from_zstd(data) {
+        Ok(decompressed) => Ok(decompressed),
+        Err(_) => Ok(data.to_vec()),
+    }
+}
 
 
 #[cfg(any(test, feature = "pg_test"))]
@@ -38,6 +45,16 @@ mod tests {
         let expected_output = hex::decode(TEST_COMP_INPUT_HEX).unwrap();
 
         assert_eq!(expected_output, crate::from_zstd(&compressed_input).unwrap().as_slice());
+    }
+
+
+    #[pg_test]
+    fn test_from_maybe_zstd() {
+        let compressed_input = hex::decode(TEST_COMP_OUTPUT_LEVEL19_HEX).unwrap();
+        let expected_output = hex::decode(TEST_COMP_INPUT_HEX).unwrap();
+
+        assert_eq!(expected_output, crate::from_maybe_zstd(&expected_output).unwrap().as_slice());
+        assert_eq!(expected_output, crate::from_maybe_zstd(&compressed_input).unwrap().as_slice());
     }
 
 }
