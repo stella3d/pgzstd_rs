@@ -1,5 +1,7 @@
 # pgzstd_rs
- simple Rust implementation of manual zstd compression in postgres
+ simple Rust implementation of manual zstd compression in postgres.
+
+**do not attempt to rely on this yet. it is not ready**
 
 
 ## Testing 
