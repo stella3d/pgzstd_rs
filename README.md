@@ -32,3 +32,10 @@ SELECT to_zstd(
 ```
 SELECT from_zstd('\x28b52ffd0068650200420a0d0ed0a5312b00e0f0089d4c266793141302d5f54372f1c196ffa16bebffb428e8f4bfcf9fb7fee9f69f83dbeffc17fff1f983aa7f0800407e402b202fa60e11f0c5338e60038c8c6206');
 ```
+
+`from_maybe_zstd` is the same as `from_zstd`, except that if the data can't be decompressed, it is returned unaltered.
+
+this allows for compressing large binary fields in-place and reading them safely.
+```
+SELECT from_maybe_zstd('\x28b52ffd0068650200420a0d0ed0a5312b00e0f0089d4c266793141302d5f54372f1c196ffa16bebffb428e8f4bfcf9fb7fee9f69f83dbeffc17fff1f983aa7f0800407e402b202fa60e11f0c5338e60038c8c6206');
+```
