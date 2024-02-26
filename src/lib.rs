@@ -1,11 +1,25 @@
 use pgrx::prelude::*;
 use zstd::{decode_all, encode_all};
+use rayon::prelude::*;
 
 pgrx::pg_module_magic!();
 
 #[pg_extern]
 pub(crate) fn to_zstd(data: &[u8], level: i32) -> Result<Vec<u8>, &'static str> {
     encode_all(data, level).map_err(|_| "Compression error")
+}
+
+#[pg_extern]
+pub(crate) fn to_zstd_parallel(data: Vec<&[u8]>, level: i32) -> Result<Vec<Vec<u8>>, &'static str> {
+    let compressed = data
+    .par_iter()
+    .map(|d| 
+        encode_all(*d, level) 
+        .map_err(|_| "Compression error")
+    )
+    .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(compressed)
 }
 
 #[pg_extern]
