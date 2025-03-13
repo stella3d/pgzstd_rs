@@ -1,8 +1,41 @@
-use pgrx::prelude::*;
+use std::ffi::CStr;
+
+use pgrx::{prelude::*, StringInfo};
 use zstd::{decode_all, encode_all};
 use rayon::prelude::*;
+use serde::{Serialize, Deserialize};
 
 pgrx::pg_module_magic!();
+
+
+#[derive(Copy, Clone, PostgresType)]
+#[pgvarlena_inoutfuncs]
+struct ZstdBytea<'a>(&'a[u8]);
+
+impl PgVarlenaInOutFuncs for ZstdBytea<'_> {
+    fn input(input: &CStr) -> PgVarlena<Self> {
+        let mut result = PgVarlena::<Self>::new();
+        
+        // if input starts with \x , strip it and decode the hex, otherwise just decode
+        let mut input = input.to_str().unwrap();
+        if input.starts_with("\\x") {
+            input = &input[2..];
+        }
+
+        let bytes = hex::decode(input).unwrap();
+        result.0 = bytes.as_slice().clone();
+
+        result
+    }
+
+    fn output(&self, buffer: &mut StringInfo) {
+        // decompress data and output as hex
+        let decompressed = decode_all(self.0).unwrap();
+        let hex = hex::encode(decompressed);
+        buffer.push_str(&hex);
+    }
+}
+
 
 #[pg_extern]
 pub(crate) fn to_zstd(data: &[u8], level: i32) -> Result<Vec<u8>, &'static str> {
