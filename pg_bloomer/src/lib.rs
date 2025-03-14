@@ -332,26 +332,21 @@ pub fn create_bound_filter_function(filter_id: i32) -> String {
         Some(handle) => {
             // Create a new bound filter and store it
             let bound_filter = Box::new(BoundBloomFilter { handle });
-            
-            // Generate a unique name based on filter ID
             let function_name = format!("bf_contains_bound_{}", filter_id);
             
             // Leak the bound filter so it lives for the program duration
             // This is intentional as we want this to persist as long as PostgreSQL is running
-            let bound_ptr = Box::into_raw(bound_filter);
-            
-            // Register the new function with PostgreSQL
-            let bound_ptr_addr = bound_ptr as usize;
+            let bound_ptr = Box::into_raw(bound_filter) as usize;
             
             // Register functions using the bound pointer
             pgrx::Spi::connect(|client| {
-                let sql = format!(
-                    "CREATE OR REPLACE FUNCTION {}_nanos(items bytea[]) RETURNS bigint AS $$
-                        SELECT pg_bloomer._bf_contains_bound_nanos({}, items);
+                let batch_sql = format!(
+                    "CREATE OR REPLACE FUNCTION {}_batch(items bytea[]) RETURNS boolean[] AS $$
+                        SELECT pg_bloomer._bf_contains_bound_batch({}, items);
                     $$ LANGUAGE SQL STRICT;", 
-                    function_name, bound_ptr_addr
+                    function_name, bound_ptr
                 );
-                match client.prepare(&sql, &vec![]) {
+                match client.prepare(&batch_sql, &vec![]) {
                     Ok(prepped) => {
                         let _ = prepped.execute(client, None, &vec![]);
                     },
@@ -359,14 +354,14 @@ pub fn create_bound_filter_function(filter_id: i32) -> String {
                         eprintln!("Error creating function {}: {}", function_name, e);
                     }
                 }
-                
-                let batch_sql = format!(
-                    "CREATE OR REPLACE FUNCTION {}_batch(items bytea[]) RETURNS boolean[] AS $$
-                        SELECT pg_bloomer._bf_contains_bound_batch({}, items);
+
+                let sql = format!(
+                    "CREATE OR REPLACE FUNCTION {}_nanos(items bytea[]) RETURNS bigint AS $$
+                        SELECT pg_bloomer._bf_contains_bound_nanos({}, items);
                     $$ LANGUAGE SQL STRICT;", 
-                    function_name, bound_ptr_addr
+                    function_name, bound_ptr
                 );
-                match client.prepare(&batch_sql, &vec![]) {
+                match client.prepare(&sql, &vec![]) {
                     Ok(prepped) => {
                         let _ = prepped.execute(client, None, &vec![]);
                     },
