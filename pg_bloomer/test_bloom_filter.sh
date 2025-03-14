@@ -53,7 +53,7 @@ echo -e "$SQL_CREATE"
 
 SETUP_FILE="bloomf_test_setup_$ARRAY_SIZE.sql"
 echo -e "$SQL_CREATE" > $SETUP_FILE
-echo -e "\filter creation query written to $SETUP_FILE"
+echo -e "\nfilter creation query written to $SETUP_FILE"
 
 echo -e "\n-- Now query the filter with a mix of values (some will match, some won't)\n"
 # Generate the query SQL command

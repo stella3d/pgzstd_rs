@@ -1,9 +1,11 @@
 use std::sync::{Arc, RwLock};
 use once_cell::sync::Lazy;
 
-use pgrx::prelude::*;
+use pgrx::{prelude::*, spi::Query};
 use fastbloom::BloomFilter;
 use serde::{Deserialize, Serialize};
+
+use rayon::prelude::*;
 
 pgrx::pg_module_magic!();
 
@@ -32,10 +34,28 @@ impl PgBloomFilter {
             .collect()
     }
 
-    pub fn contains_optional_batch<'a>(&self, items: impl Iterator<Item = Option<&'a [u8]>>) -> Vec<bool> {
-        // Acquire lock once for entire batch
-        //let filter = self.filter.read().expect("Failed to read filter");
+    pub fn contains_optional_batch<'a, T: Iterator<Item = Option<&'a [u8]>>>(&self, items: T) -> Vec<bool> {
         items
+            .map(|elem| match elem {
+                Some(item) => self.filter.contains(item),
+                None => false,
+            })
+            .collect()
+    }
+
+    pub fn contains_batch_parallel<'a, T: Iterator<Item = Option<&'a [u8]>> + Send>(&self, items: T) -> Vec<bool> {
+        items.par_bridge()
+            .into_par_iter()
+            .map(|elem| match elem {
+                Some(item) => self.filter.contains(item),
+                None => false,
+            })
+            .collect()
+    }
+
+    pub fn contains_batch_par<'a>(&self, items: Vec<Option<&'a [u8]>>) -> Vec<bool> {
+        items
+            .into_par_iter()
             .map(|elem| match elem {
                 Some(item) => self.filter.contains(item),
                 None => false,
@@ -73,16 +93,25 @@ pub struct BloomFilterHandle {
 }
 
 impl BloomFilterHandle {
+    #[inline]
     pub fn contains(&self, item: &[u8]) -> bool {
         self.filter.contains(item)
     }
-    
+    #[inline]
     pub fn contains_batch<'a>(&self, items: impl Iterator<Item = &'a [u8]>) -> Vec<bool> {
         self.filter.contains_batch(items)
     }
-
+    #[inline]
     pub fn contains_optional_batch<'a>(&self, items: impl Iterator<Item = Option<&'a [u8]>>) -> Vec<bool> {
         self.filter.contains_optional_batch(items)
+    }
+    #[inline]
+    pub fn contains_batch_parallel<'a, T: Iterator<Item = Option<&'a [u8]>> + Send>(&self, items: T) -> Vec<bool> {
+        self.filter.contains_batch_parallel(items)
+    }
+    #[inline]
+    pub fn contains_batch_par<'a>(&self, items: Vec<Option<&'a [u8]>>) -> Vec<bool> {
+        self.filter.contains_batch_par(items)
     }
 }
 
@@ -93,7 +122,7 @@ pub(crate) static FILTER_REGISTRY: Lazy<RwLock<Vec<Arc<PgBloomFilter>>>> =
 
 // Thread-local cache of filter handles
 thread_local! {
-    static HANDLE_CACHE: std::cell::RefCell<Vec<Option<BloomFilterHandle>>> = std::cell::RefCell::new(Vec::new());
+    static HANDLE_CACHE: std::cell::RefCell<Vec<BloomFilterHandle>> = std::cell::RefCell::new(Vec::new());
 }
 
 #[pg_extern]
@@ -111,15 +140,8 @@ pub fn new_bloom_filter(false_positive_rate: f64, expected_item_count: i64) -> i
 
 #[pg_extern]
 pub fn new_bloom_filter_from_items<'a>(false_positive_rate: f64, items: pgrx::Array<&'a [u8]>) -> i32 {
-    let mut filter = BloomFilter::with_false_pos(false_positive_rate)
-        .expected_items(items.len());
+    let filter = BloomFilter::with_false_pos(false_positive_rate).items(items.iter());
 
-    for item in items.iter() {
-        if let Some(item) = item {
-            filter.insert(item);
-        }
-    }
-    
     let filter = Arc::new(PgBloomFilter { filter });
     
     // Atomically increment the counter without lock
@@ -136,46 +158,54 @@ pub(crate) fn get_bloom_filter_handle(filter_id_int: i32) -> Option<BloomFilterH
     let filter_id = filter_id_int as usize;
 
     // Check the thread-local cache first
-    let mut found_in_cache = false;
-    let handle = HANDLE_CACHE.with(|cache| {
+    let cached_handle = HANDLE_CACHE.with(|cache| {
         let cache = cache.borrow();
         if filter_id < cache.len() {
-            if let Some(handle) = &cache[filter_id] {
-                found_in_cache = true;
-                return Some(handle.clone());
-            }
+            Some(cache[filter_id].clone())
+        } else {
+            None
         }
-        None
     });
+
+    if let Some(handle) = cached_handle {
+        return Some(handle); // Successfully retrieved from cache
+    }
+
+    // Cache miss - get from registry with lock
+    let registry_guard = FILTER_REGISTRY.read()
+        .expect("Failed to acquire registry read lock");
     
-    if found_in_cache {
-        return handle;
+    if filter_id >= registry_guard.len() {
+        // No filter with this ID exists
+        info!("Filter ID {} not found in registry (len: {})", filter_id, registry_guard.len());
+        return None;
     }
     
-    // If not in cache, get from registry (this requires a lock)
-    let registry = FILTER_REGISTRY.read().expect("Failed to acquire registry read lock");
-    
-    let handle = if (filter_id) < registry.len() {
-        Some(BloomFilterHandle {
-            filter: registry[filter_id].clone(),
-        })
-    } else {
-        None
+    // Create a new handle from the registry entry
+    let handle = BloomFilterHandle {
+        filter: registry_guard[filter_id].clone(),
     };
     
-    // Cache the handle for future lock-free access
-    if let Some(handle) = &handle {
-        HANDLE_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if (filter_id) >= cache.len() {
-                cache.resize_with(filter_id + 1, || None);
-            }
-            cache[filter_id] = Some(handle.clone());
-        });
-    }
+    // Cache the handle for future access
+    HANDLE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        
+        // Make sure the cache is large enough
+        if filter_id >= cache.len() {
+            info!("Resizing cache from {} to {}", cache.len(), filter_id + 1);
+            cache.resize_with(filter_id + 1, || handle.clone());
+        }
+        
+        // Store the actual handle
+        cache[filter_id] = handle.clone();
+    });
     
-    handle
+    // Return the newly created handle
+    Some(handle)
 }
+
+// Add this at the top with other imports
+use pgrx::info;
 
 // Optimized contains that uses handles
 #[pg_extern]
@@ -194,6 +224,187 @@ pub fn bloom_filter_contains_batch(filter_id: i32, items: pgrx::Array<&[u8]>) ->
         },
         None => vec![false; items.len()],
     }
+}
+
+#[pg_extern]
+pub fn bf_contains_parallel(filter_id: i32, items: pgrx::Array<&[u8]>) -> Vec<bool> {
+    match get_bloom_filter_handle(filter_id) {
+        Some(handle) => {
+            let owned_items: Vec<Option<Vec<u8>>> = items
+                .iter()
+                .map(|item| item.map(|s| s.to_owned()))
+                .collect();
+
+            owned_items
+                .par_iter()
+                .map(|item| match item {
+                    Some(item) => handle.contains(item),
+                    None => false,
+                })
+                .collect()
+        },
+        None => vec![false; items.len()],
+    }
+}
+
+
+#[pg_extern]
+pub fn bf_contains_parallel_slice(filter_id: i32, items: pgrx::Array<&[u8]>) -> Vec<bool> {
+    match get_bloom_filter_handle(filter_id) {
+        Some(handle) => {
+            let owned_items: Vec<Option<&[u8]>> = items
+                .iter()
+                .map(|item| item)
+                .collect();
+
+            owned_items
+                .par_iter()
+                .map(|item| match item {
+                    Some(item) => handle.contains(item),
+                    None => false,
+                })
+                .collect()
+        },
+        None => vec![false; items.len()],
+    }
+}
+
+#[pg_extern]
+pub fn bf_contains_parallel_nanos(filter_id: i32, items: pgrx::Array<&[u8]>) -> i64 {
+    let start = std::time::Instant::now();
+
+    match get_bloom_filter_handle(filter_id) {
+        Some(handle) => {
+            let owned_items: Vec<Option<&[u8]>> = items
+                .iter()
+                .map(|item| item)
+                .collect();
+
+            let _res: Vec<bool> = handle.contains_batch_par(owned_items);
+
+            let duration = start.elapsed();
+            let duration_nanos = duration.as_nanos() as i64;
+            duration_nanos
+        },
+        None => 0,
+    }
+}
+
+#[pg_extern]
+pub fn bf_contains_nanos(filter_id: i32, items: pgrx::Array<&[u8]>) -> i64 {
+    let start = std::time::Instant::now();
+
+    match get_bloom_filter_handle(filter_id) {
+        Some(handle) => {
+            let _res = handle.contains_optional_batch(items.iter());
+            let duration = start.elapsed();
+            let duration_nanos = duration.as_nanos() as i64;
+            duration_nanos
+        },
+        None => 0,
+    }
+}
+
+#[pg_extern]
+pub fn bloom_filter_serialize(filter_id: i32) -> Option<Vec<u8>> {
+    let registry = FILTER_REGISTRY.read().expect("Failed to acquire registry read lock");
+
+    match registry.get(filter_id as usize) {
+        Some(filter) => {
+            match postcard::to_allocvec(filter.as_ref()) {
+                Ok(serialized) => Some(serialized),
+                Err(_) => None,
+            }
+        },
+        None => None,
+    }
+}
+
+// A special type to hold a pre-bound bloom filter handle
+struct BoundBloomFilter {
+    handle: BloomFilterHandle,
+}
+
+#[pg_extern(volatile)]
+pub fn create_bound_filter_function(filter_id: i32) -> String {
+    // Get the filter handle once
+    match get_bloom_filter_handle(filter_id) {
+        Some(handle) => {
+            // Create a new bound filter and store it
+            let bound_filter = Box::new(BoundBloomFilter { handle });
+            
+            // Generate a unique name based on filter ID
+            let function_name = format!("bf_contains_bound_{}", filter_id);
+            
+            // Leak the bound filter so it lives for the program duration
+            // This is intentional as we want this to persist as long as PostgreSQL is running
+            let bound_ptr = Box::into_raw(bound_filter);
+            
+            // Register the new function with PostgreSQL
+            let bound_ptr_addr = bound_ptr as usize;
+            
+            // Register functions using the bound pointer
+            pgrx::Spi::connect(|client| {
+                let sql = format!(
+                    "CREATE OR REPLACE FUNCTION {}_nanos(items bytea[]) RETURNS bigint AS $$
+                        SELECT pg_bloomer._bf_contains_bound_nanos({}, items);
+                    $$ LANGUAGE SQL STRICT;", 
+                    function_name, bound_ptr_addr
+                );
+                match client.prepare(&sql, &vec![]) {
+                    Ok(prepped) => {
+                        let _ = prepped.execute(client, None, &vec![]);
+                    },
+                    Err(e) => {
+                        eprintln!("Error creating function {}: {}", function_name, e);
+                    }
+                }
+                
+                let batch_sql = format!(
+                    "CREATE OR REPLACE FUNCTION {}_batch(items bytea[]) RETURNS boolean[] AS $$
+                        SELECT pg_bloomer._bf_contains_bound_batch({}, items);
+                    $$ LANGUAGE SQL STRICT;", 
+                    function_name, bound_ptr_addr
+                );
+                match client.prepare(&batch_sql, &vec![]) {
+                    Ok(prepped) => {
+                        let _ = prepped.execute(client, None, &vec![]);
+                    },
+                    Err(e) => {
+                        eprintln!("Error creating function {}: {}", function_name, e);
+                    }
+                }
+            });
+            
+            format!("Created bound functions: {}_nanos and {}_batch", function_name, function_name)
+        },
+        None => format!("Error: Filter with ID {} not found", filter_id),
+    }
+}
+
+// Internal function that will be called by the dynamically created SQL function
+#[pg_extern(name = "_bf_contains_bound_nanos")]
+pub fn _bf_contains_bound_nanos(bound_ptr_addr: i64, items: pgrx::Array<&[u8]>) -> i64 {
+    let start = std::time::Instant::now();
+    
+    // Safety: This pointer was created in create_bound_filter_function and is valid 
+    // for the lifetime of the PostgreSQL server
+    let bound_filter = unsafe { &*(bound_ptr_addr as *const BoundBloomFilter) };
+    
+    let _res = bound_filter.handle.contains_optional_batch(items.iter());
+    
+    let duration = start.elapsed();
+    duration.as_nanos() as i64
+}
+
+// Internal function that will be called by the dynamically created SQL function
+#[pg_extern(name = "_bf_contains_bound_batch")]
+pub fn _bf_contains_bound_batch(bound_ptr_addr: i64, items: pgrx::Array<&[u8]>) -> Vec<bool> {
+    // Safety: This pointer was created in create_bound_filter_function and is valid
+    // for the lifetime of the PostgreSQL server
+    let bound_filter = unsafe { &*(bound_ptr_addr as *const BoundBloomFilter) };
+    
+    bound_filter.handle.contains_optional_batch(items.iter())
 }
 
 #[cfg(any(test, feature = "pg_test"))]

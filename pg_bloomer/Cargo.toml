@@ -25,6 +25,8 @@ pgrx = { workspace = true }
 pgrx-tests = { workspace = true }
 fastbloom = { version = "0.9.0", features = ["rand", "serde"] }
 once_cell = "1.18"
+postcard = { version = "1.1.1", features = ["heapless", "heapless-cas", "alloc", "use-std"] }
+rayon.workspace = true
 
 [dev-dependencies]
 hex = { workspace = true }
