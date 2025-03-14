@@ -1,30 +1,17 @@
-[package]
-name = "pgzstd_rs"
-version = "0.0.0"
-edition = "2021"
+[workspace]
+members = [
+    "pgzstd_rs",
+    "pg_bloomer"
+]
+resolver = "2"
 
-[lib]
-crate-type = ["cdylib"]
-
-[features]
-default = ["pg16"]
-pg11 = ["pgrx/pg11", "pgrx-tests/pg11" ]
-pg12 = ["pgrx/pg12", "pgrx-tests/pg12" ]
-pg13 = ["pgrx/pg13", "pgrx-tests/pg13" ]
-pg14 = ["pgrx/pg14", "pgrx-tests/pg14" ]
-pg15 = ["pgrx/pg15", "pgrx-tests/pg15" ]
-pg16 = ["pgrx/pg16", "pgrx-tests/pg16" ]
-pg_test = []
-
-[dependencies]
+[workspace.dependencies]
 hex = "0.4.3"
-pgrx = "=0.11.3"
+pgrx = "=0.13.1"
+pgrx-tests = "=0.13.1"
 rayon = "1.8.1"
-serde = { version = "1.0.197", features = ["derive"] }
+serde = { version = "1.0.219", features = ["derive"] }
 zstd = "0.13"
-
-[dev-dependencies]
-pgrx-tests = "=0.11.3"
 
 [profile.dev]
 panic = "unwind"
